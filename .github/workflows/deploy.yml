@@ -23,7 +23,10 @@ jobs:
       - name: Run tests (optional)
         run: npm test
         
+      - name: Install Railway CLI
+        uses: railway-app/setup-railway@v1
+        
       - name: Deploy to Railway
-        uses: railwayapp/cli-action@v1
-        with:
-          railwayToken: ${{ secrets.RAILWAY_TOKEN }}
+        run: railway up --detach
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
