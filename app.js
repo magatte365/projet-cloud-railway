@@ -23,40 +23,58 @@ app.use((req, res, next) => {
   next();
 });
 
-// Configuration de Sequelize pour MySQL
-// Pour Railway, nous utilisons la variable d'environnement DATABASE_URL si disponible
-const dbConfig = process.env.DATABASE_URL || {
-  host: process.env.DB_HOST || 'localhost',
-  username: process.env.DB_USER || 'root',
-  password: process.env.DB_PASSWORD || '',
-  database: process.env.DB_NAME || 'tasksdb',
-  port: process.env.DB_PORT || 3306,
-  dialect: 'mysql'
-};
+// Déterminer si nous utilisons des connexions privées Railway ou locales
+const isRailway = process.env.RAILWAY_ENVIRONMENT === 'production';
 
-// Création de l'instance Sequelize
-const sequelize = process.env.DATABASE_URL 
-  ? new Sequelize(process.env.DATABASE_URL, {
-      dialect: 'mysql',
-      dialectOptions: {
-        ssl: {
-          require: true,
-          rejectUnauthorized: false
-        }
-      }
-    })
-  : new Sequelize(dbConfig.database, dbConfig.username, dbConfig.password, {
-      host: dbConfig.host,
-      port: dbConfig.port,
-      dialect: dbConfig.dialect,
-      pool: {
-        max: 5,
-        min: 0,
-        acquire: 30000,
-        idle: 10000
-      },
-      logging: false
-    });
+// Configuration de Sequelize pour MySQL
+// Privilégier les connexions privées sur Railway
+let sequelize;
+
+if (isRailway) {
+  // Variables Railway pour les connexions privées
+  const dbName = process.env.MYSQL_DATABASE;
+  const dbUser = process.env.MYSQL_USER;
+  const dbPassword = process.env.MYSQL_PASSWORD;
+  const dbHost = process.env.MYSQL_HOST || process.env.MYSQLHOST;  // Railway peut utiliser l'un ou l'autre
+  const dbPort = process.env.MYSQL_PORT || process.env.MYSQLPORT || 3306;
+
+  console.log("Tentative de connexion à MySQL avec les paramètres Railway (connexion privée)");
+  console.log(`Host: ${dbHost}, Database: ${dbName}, User: ${dbUser}, Port: ${dbPort}`);
+
+  sequelize = new Sequelize(dbName, dbUser, dbPassword, {
+    host: dbHost,
+    port: dbPort,
+    dialect: 'mysql',
+    dialectOptions: {
+      // Sans SSL pour les connexions privées entre services Railway
+    },
+    logging: false
+  });
+} else {
+  // Configuration locale (développement)
+  const dbConfig = {
+    host: process.env.DB_HOST || 'localhost',
+    username: process.env.DB_USER || 'root',
+    password: process.env.DB_PASSWORD || '',
+    database: process.env.DB_NAME || 'tasksdb',
+    port: process.env.DB_PORT || 3306,
+    dialect: 'mysql'
+  };
+
+  console.log("Utilisation de la configuration de base de données locale");
+  sequelize = new Sequelize(dbConfig.database, dbConfig.username, dbConfig.password, {
+    host: dbConfig.host,
+    port: dbConfig.port,
+    dialect: dbConfig.dialect,
+    pool: {
+      max: 5,
+      min: 0,
+      acquire: 30000,
+      idle: 10000
+    },
+    logging: false
+  });
+}
 
 // Définition du modèle Task avec Sequelize
 const Task = sequelize.define('Task', {
@@ -172,12 +190,46 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: "Erreur serveur interne" });
 });
 
+// Fonction pour tenter une connexion avec retries
+async function connectWithRetry(maxRetries = 5, delay = 5000) {
+  let retries = 0;
+  
+  while (retries < maxRetries) {
+    try {
+      // Tester la connexion à la base de données
+      await sequelize.authenticate();
+      console.log('Connexion à MySQL établie avec succès.');
+      return true;
+    } catch (error) {
+      retries++;
+      console.log(`Tentative de connexion échouée (${retries}/${maxRetries}): ${error.message}`);
+      if (retries < maxRetries) {
+        console.log(`Nouvelle tentative dans ${delay/1000} secondes...`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      } else {
+        console.error('Impossible de se connecter à la base de données après plusieurs tentatives:', error);
+        return false;
+      }
+    }
+  }
+}
+
 // Synchroniser le modèle avec la base de données et démarrer le serveur
 async function startServer() {
   try {
-    // Tester la connexion à la base de données
-    await sequelize.authenticate();
-    console.log('Connexion à MySQL établie avec succès.');
+    // Tenter de se connecter à la base de données avec des retries
+    const connected = await connectWithRetry();
+    
+    if (!connected) {
+      console.error("Échec de connexion à la base de données après plusieurs tentatives. Démarrage du serveur sans base de données.");
+      // Démarrer le serveur même sans base de données pour permettre le healthcheck
+      const PORT = process.env.PORT || 3000;
+      app.listen(PORT, () => {
+        console.log(`Serveur démarré sur le port ${PORT} (SANS connexion DB)`);
+        console.log(`Mode: ${process.env.NODE_ENV || 'development'}`);
+      });
+      return;
+    }
     
     // Synchroniser les modèles avec la base de données
     // force: false - ne pas supprimer les tables existantes
@@ -192,7 +244,7 @@ async function startServer() {
       console.log(`Mode: ${process.env.NODE_ENV || 'development'}`);
     });
   } catch (error) {
-    console.error('Impossible de se connecter à la base de données:', error);
+    console.error('Erreur lors du démarrage du serveur:', error);
   }
 }
 
