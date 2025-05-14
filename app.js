@@ -1,5 +1,5 @@
 const express = require('express');
-const mongoose = require('mongoose');
+const { Sequelize, DataTypes } = require('sequelize');
 const dotenv = require('dotenv');
 const path = require('path');
 
@@ -23,30 +23,68 @@ app.use((req, res, next) => {
   next();
 });
 
-// Modèle MongoDB
-const Task = mongoose.model('Task', {
+// Configuration de Sequelize pour MySQL
+// Pour Railway, nous utilisons la variable d'environnement DATABASE_URL si disponible
+const dbConfig = process.env.DATABASE_URL || {
+  host: process.env.DB_HOST || 'localhost',
+  username: process.env.DB_USER || 'root',
+  password: process.env.DB_PASSWORD || '',
+  database: process.env.DB_NAME || 'tasksdb',
+  port: process.env.DB_PORT || 3306,
+  dialect: 'mysql'
+};
+
+// Création de l'instance Sequelize
+const sequelize = process.env.DATABASE_URL 
+  ? new Sequelize(process.env.DATABASE_URL, {
+      dialect: 'mysql',
+      dialectOptions: {
+        ssl: {
+          require: true,
+          rejectUnauthorized: false
+        }
+      }
+    })
+  : new Sequelize(dbConfig.database, dbConfig.username, dbConfig.password, {
+      host: dbConfig.host,
+      port: dbConfig.port,
+      dialect: dbConfig.dialect,
+      pool: {
+        max: 5,
+        min: 0,
+        acquire: 30000,
+        idle: 10000
+      },
+      logging: false
+    });
+
+// Définition du modèle Task avec Sequelize
+const Task = sequelize.define('Task', {
   title: {
-    type: String,
-    required: [true, 'Le titre est requis']
+    type: DataTypes.STRING,
+    allowNull: false,
+    validate: {
+      notEmpty: {
+        msg: 'Le titre est requis'
+      }
+    }
   },
-  description: String,
+  description: {
+    type: DataTypes.TEXT,
+    allowNull: true
+  },
   completed: {
-    type: Boolean,
-    default: false
+    type: DataTypes.BOOLEAN,
+    defaultValue: false
   },
   createdAt: {
-    type: Date,
-    default: Date.now
+    type: DataTypes.DATE,
+    defaultValue: DataTypes.NOW
   }
+}, {
+  tableName: 'tasks',
+  timestamps: true
 });
-
-// Middleware pour la gestion des erreurs MongoDB
-const handleMongoError = (err, req, res, next) => {
-  if (err instanceof mongoose.Error) {
-    return res.status(400).json({ error: err.message });
-  }
-  next(err);
-};
 
 // Route pour la page d'accueil
 app.get('/', (req, res) => {
@@ -65,18 +103,22 @@ app.get('/api/health', (req, res) => {
 // Endpoint pour créer une tâche (WRITE)
 app.post('/api/tasks', async (req, res) => {
   try {
-    const task = new Task(req.body);
-    await task.save();
+    const task = await Task.create(req.body);
     res.status(201).json(task);
   } catch (error) {
-    res.status(400).json({ error: error.message });
+    res.status(400).json({ 
+      error: error.message,
+      details: error.errors ? error.errors.map(e => e.message) : null 
+    });
   }
 });
 
 // Endpoint pour récupérer toutes les tâches (READ)
 app.get('/api/tasks', async (req, res) => {
   try {
-    const tasks = await Task.find().sort({ createdAt: -1 });
+    const tasks = await Task.findAll({
+      order: [['createdAt', 'DESC']]
+    });
     res.json(tasks);
   } catch (error) {
     res.status(500).json({ error: error.message });
@@ -86,8 +128,16 @@ app.get('/api/tasks', async (req, res) => {
 // Endpoint pour mettre à jour une tâche (UPDATE)
 app.put('/api/tasks/:id', async (req, res) => {
   try {
-    const task = await Task.findByIdAndUpdate(req.params.id, req.body, { new: true, runValidators: true });
-    if (!task) return res.status(404).json({ error: "Tâche non trouvée" });
+    const [updated] = await Task.update(req.body, {
+      where: { id: req.params.id },
+      returning: true
+    });
+    
+    if (updated === 0) {
+      return res.status(404).json({ error: "Tâche non trouvée" });
+    }
+    
+    const task = await Task.findByPk(req.params.id);
     res.json(task);
   } catch (error) {
     res.status(400).json({ error: error.message });
@@ -97,8 +147,14 @@ app.put('/api/tasks/:id', async (req, res) => {
 // Endpoint pour supprimer une tâche (DELETE)
 app.delete('/api/tasks/:id', async (req, res) => {
   try {
-    const task = await Task.findByIdAndDelete(req.params.id);
-    if (!task) return res.status(404).json({ error: "Tâche non trouvée" });
+    const deleted = await Task.destroy({
+      where: { id: req.params.id }
+    });
+    
+    if (deleted === 0) {
+      return res.status(404).json({ error: "Tâche non trouvée" });
+    }
+    
     res.json({ message: "Tâche supprimée avec succès" });
   } catch (error) {
     res.status(400).json({ error: error.message });
@@ -116,42 +172,42 @@ app.use((err, req, res, next) => {
   res.status(500).json({ error: "Erreur serveur interne" });
 });
 
-// Connexion à MongoDB avec options optimisées pour Railway
-// Pour Railway, nous utilisons la variable d'environnement DATABASE_URL si disponible
-const MONGO_URI = process.env.DATABASE_URL || process.env.MONGO_URI || 'mongodb://localhost:27017/tasksdb';
-
-mongoose.connect(MONGO_URI, {
-  // Ces options sont recommandées pour assurer une connexion stable
-  // même si Railway redémarre votre application ou modifie son environnement
-  retryWrites: true,
-  w: 'majority',
-  serverSelectionTimeoutMS: 5000,
-  socketTimeoutMS: 45000,
-})
-  .then(() => console.log('Connecté à MongoDB'))
-  .catch(err => {
-    console.error('Erreur de connexion à MongoDB:', err);
-    // Ne pas faire crasher l'app complètement, Railway pourrait la redémarrer
-    // et cela permettrait des nouvelles tentatives de connexion
-  });
+// Synchroniser le modèle avec la base de données et démarrer le serveur
+async function startServer() {
+  try {
+    // Tester la connexion à la base de données
+    await sequelize.authenticate();
+    console.log('Connexion à MySQL établie avec succès.');
+    
+    // Synchroniser les modèles avec la base de données
+    // force: false - ne pas supprimer les tables existantes
+    await sequelize.sync({ force: false });
+    console.log('Modèles synchronisés avec la base de données.');
+    
+    // Démarrer le serveur
+    // Railway définit automatiquement la variable PORT
+    const PORT = process.env.PORT || 3000;
+    app.listen(PORT, () => {
+      console.log(`Serveur démarré sur le port ${PORT}`);
+      console.log(`Mode: ${process.env.NODE_ENV || 'development'}`);
+    });
+  } catch (error) {
+    console.error('Impossible de se connecter à la base de données:', error);
+  }
+}
 
 // Gestion propre de la fermeture pour Railway
 process.on('SIGINT', async () => {
-  await mongoose.connection.close();
-  console.log('Connexion MongoDB fermée suite à l\'arrêt de l\'application');
+  await sequelize.close();
+  console.log('Connexion à la base de données fermée suite à l\'arrêt de l\'application');
   process.exit(0);
 });
 
 process.on('SIGTERM', async () => {
-  await mongoose.connection.close();
-  console.log('Connexion MongoDB fermée suite à l\'arrêt de l\'application');
+  await sequelize.close();
+  console.log('Connexion à la base de données fermée suite à l\'arrêt de l\'application');
   process.exit(0);
 });
 
 // Démarrer le serveur
-// Railway définit automatiquement la variable PORT
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Serveur démarré sur le port ${PORT}`);
-  console.log(`Mode: ${process.env.NODE_ENV || 'development'}`);
-});
+startServer();
