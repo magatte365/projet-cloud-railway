@@ -24,7 +24,7 @@ jobs:
         run: npm test
         
       - name: Install Railway CLI
-        uses: railway-app/setup-railway@v1
+        run: npm install -g @railway/cli
         
       - name: Deploy to Railway
         run: railway up --detach
